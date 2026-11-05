@@ -272,10 +272,93 @@ def analyze(root: Path):
             except: pass
     return {"by_proc":{k:sorted(v) for k,v in by_proc.items()},"empty_dirs":empty,"per_file":per_file,"issues":issues,"restarts":restarts,"facts":facts,"total_files":len(files),"redis_validation":validate_redis(root)}
 
+def classify_group(relpath):
+    p=relpath.replace("\\","/").lower()
+    if "/redis/" in p or "redis_info" in p or p.endswith("6666.log.gz"): return "redis"
+    if "/clickhouse/" in p: return "clickhouse"
+    if "/pm2/" in p: return "pm2"
+    if "var_log_httpd" in p or "ssl_error" in p or "ssl_access" in p or "ssl_request" in p: return "httpd"
+    if "server.log" in p or "glassfish" in p or p.startswith("appsvr/") or "/appsvr/" in p: return "appsvr"
+    if p.startswith("backend/") or "/backend/" in p: return "backend"
+    if p.startswith("postgres/") or "/postgres/" in p: return "postgres"
+    if p.startswith("system/") or "/system/" in p or p.startswith("configcollection/"): return "system"
+    if p.startswith("upgrade/"): return "upgrade"
+    return classify(relpath)
+
+TROUBLESHOOT = {
+ "backend": ["phxctl status / phoenix.log tail - check which ph* worker is down", "dmesg | grep -i segfault - crash times, correlate with minidump IST time", "phtools - check lookup table load: grep PH_LOOKUP_TABLE_CANNOT_LOAD_DATA phoenix.log", "If phRuleWorker CPU >100% and RES >3GB, check FortiGuard namedValue size in pm2 access.log"],
+ "appsvr": ["systemctl status glassfish / asadmin list-domains - is domain1 up?", "curl -k https://127.0.0.1:8282/ - GlassFish listening?", "grep JedisConnectionException appsvr/server.log | head - pool open?", "grep PH_APPSERVER_REDIS_ERROR appsvr/phoenix.log - RedisSubscriber alive?"],
+ "redis": ["redis-cli -p 6666 -a <pass> INFO clients - connected_clients vs maxclients, rejected_connections", "redis-cli -p 6666 INFO replication - role, master_link_status, slave lag", "redis-cli -p 6666 INFO memory - used_memory vs maxmemory 4G, evicted_keys", "grep -E 'max number|Ready to accept|User requested shutdown|Connection with replica.*lost|Full resync' 6666.log - restart/replication timeline", "Check who sends SIGTERM: phxctl.log, messages, systemd journal at shutdown minutes"],
+ "clickhouse": ["clickhouse-client --query 'SELECT * FROM system.tables LIMIT 5' - is CH up on localhost:9000?", "Check config.xml listen address, and whether this node role should run CH", "df -h /data - CH data disk, broken parts in clickhouse_tables.out"],
+ "pm2": ["pm2 status - FortiSIEM Node REST API online? restarts count?", "pm2 logs FortiSIEM-Node-REST-API --lines 100 - ioredis ECONNREFUSED 127.0.0.1:6666?", "grep FORTIGUARD pm2/access.log - GET sizes for MAL_DOMAIN (~61MB), BLOCKED_URL (~25MB)", "pm2 monit - Node heap, max_memory_restart 32G in ecosystem.config.js"],
+ "httpd": ["httpd -t - config test before restart", "grep -c 'Failed to lock proc mutex' ssl_error_log - ModSecurity, client 10.x /evthandler2", "grep '127.0.0.1:8282' ssl_error_log - GlassFish proxy down?", "tail ssl_access_log - 5xx spikes by IP/URI"],
+ "postgres": ["psql -c 'SELECT pid,state,state_change FROM pg_stat_activity WHERE datname=\\'phoenixdb\\'' - idle in transaction >15min?", "Check cron pg_terminate_backend job - is it killing phoenix connections?", "postgres log for FATAL / could not connect"],
+ "system": ["df -h - /data 80% /archive 86% in worker bundle, plan retention", "free -h, vmstat, top - swap in use, phRuleWorker CPU", "grep rsyslog.conf messages - line 28 parse error, rsyslogd -N1", "smartctl /dev/sda /dev/sdb - smartd terminated repeatedly"],
+ "upgrade": ["Check ansible.log for failed tasks, not runtime - upgrade/config only"],
+}
+
+def health_for(res):
+    groups=["backend","appsvr","clickhouse","redis","pm2","httpd","postgres","system"]
+    health={}
+    for g in groups:
+        iss=[i for i in res["issues"] if classify_group(i["file"])==g or i["proc"]==g]
+        crit=sum(1 for i in iss if i["sev"]=="CRITICAL")
+        err=sum(1 for i in iss if i["sev"]=="ERROR")
+        status="CRITICAL" if crit else ("WARN" if err else "OK")
+        health[g]={"status":status,"critical":crit,"error":err,"issues":iss}
+    # disk/memory from facts
+    facts_txt=" ".join(res.get("facts",{}).values())
+    disk_warn = "80%" in facts_txt or "86%" in facts_txt
+    overall="CRITICAL" if any(v["critical"] for v in health.values()) else ("WARN" if any(v["error"] for v in health.values()) else "OK")
+    return overall, health
+
 def render_md(name, res):
     out=[]
     out.append(f"# AO Logs Analysis - {name}")
     out.append("")
+    overall, health = health_for(res)
+    out.append(f"## 1. HEALTH STATUS - read this first")
+    out.append(f"Overall verdict: [{overall}]  Files: {res['total_files']}  Issues: {len(res['issues'])}  Restarts: {len(res['restarts'])}")
+    out.append("")
+    out.append("| Subsystem | Status | Critical | Error | What to check first |")
+    out.append("|---|---|---|---|---|")
+    for g in ["backend","appsvr","clickhouse","redis","pm2","httpd","postgres","system"]:
+        h=health[g]
+        first_check = TROUBLESHOOT.get(g,[""])[0]
+        out.append(f"| {g} | [{h['status']}] | {h['critical']} | {h['error']} | {first_check} |")
+    out.append("")
+    rv0=res.get("redis_validation",{})
+    if rv0.get("info"):
+        out.append("Redis snapshot (from redis_info.out, proof not assumption):")
+        for k,v in rv0["info"].items(): out.append(f"- {k}: {v}")
+        out.append("")
+    if rv0.get("log_counts"):
+        out.append("Redis log counts (full log):")
+        for k,v in rv0["log_counts"].items(): out.append(f"- {k}: {v}")
+        out.append("")
+    # disk/memory facts summary
+    for k,v in res.get("facts",{}).items():
+        if "df" in k or "phstatus" in k or "AO_VERSION" in k or "phshowVersion" in k:
+            out.append(f"### {k}")
+            out.append("```")
+            out.append(v[:1200])
+            out.append("```")
+    out.append("")
+    out.append("## 2. ERRORS BY SUBSYSTEM - CRITICAL first, fix per issue")
+    for g in ["backend","appsvr","clickhouse","redis","pm2","httpd","postgres","system","upgrade","other"]:
+        iss=[i for i in res["issues"] if classify_group(i["file"])==g or i["proc"]==g]
+        if not iss: continue
+        out.append(f"### {g.upper()} - [{health.get(g,{}).get('status','?')}] {len(iss)} issues")
+        order={"CRITICAL":0,"ERROR":1}
+        for i in sorted(iss, key=lambda x:order.get(x["sev"],2)):
+            tag="[CRITICAL]" if i["sev"]=="CRITICAL" else "[ERROR]"
+            out.append(f"- {tag} {i['type']} - {i['file']}")
+            out.append(f"  Evidence: {i['line']}")
+            out.append(f"  Fix: {i['fix']}")
+        out.append(f"  Troubleshooting commands for {g}:")
+        for cmd in TROUBLESHOOT.get(g,[]):
+            out.append(f"    $ {cmd}")
+        out.append("")
     out.append("## Inventory by process")
     for proc, files in sorted(res["by_proc"].items()):
         out.append(f"- **{proc}**: {len(files)} files")
@@ -310,7 +393,7 @@ def render_md(name, res):
         out.append(f"- [RESTART-ALERT] [{r['proc']}] {r['file']}: {r['line']}")
     if len(res["restarts"])>200: out.append(f"- ... +{len(res['restarts'])-200} more restart lines (see JSON)")
     out.append("")
-    out.append(f"## Issues by process - CRITICAL first ({len(res['issues'])})")
+    out.append(f"## 4. All issues detailed - CRITICAL first ({len(res['issues'])})")
     order={"CRITICAL":0,"ERROR":1}
     for iss in sorted(res["issues"], key=lambda x:(order.get(x["sev"],2), x["proc"])):
         tag="[CRITICAL]" if iss["sev"]=="CRITICAL" else "[ERROR]"
