@@ -1,0 +1,26 @@
+# AO logs, uploads, reports - never commit real customer data
+input/*
+!input/README.txt
+uploads/*
+!uploads/.gitkeep
+reports/*
+!reports/.gitkeep
+analysis/
+!analysis/.gitkeep
+*.tar
+*.tgz
+*.tar.gz
+*.zip
+*.log.gz
+*.minidump.gz
+*.minidump
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+# Secrets that can appear in FortiSIEM configs/logs
+6666.conf
+phoenix_config*.txt
+*.p12
+*.key
+*.crt

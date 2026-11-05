@@ -1,0 +1,7 @@
+2026-11-05T09:12:01Z INFO device=FortiGate host=edge-fw-01 src=10.0.0.20 dst=8.8.8.8 event=login_success user=admin
+2026-11-05T09:12:03Z WARN device=FortiGate host=edge-fw-01 src=203.0.113.45 msg="Repeated login failures" count=12
+2026-11-05T09:12:04Z ERROR device=FortiGate host=edge-fw-01 src=203.0.113.45 msg="Authentication failed" reason=bad_password
+2026-11-05T09:12:05Z ERROR device=FortiGate host=edge-fw-01 src=203.0.113.45 msg="Authentication failed" reason=bad_password
+2026-11-05T09:12:06Z CRITICAL device=FortiSIEM host=siem-01 src=203.0.113.45 msg="Brute force detected" rule=AUTH_BRUTE_FORCE sev=1
+2026-11-05T09:13:00Z INFO device=FortiSIEM host=siem-01 msg="Rule evaluated" rule=AUTH_BRUTE_FORCE result=triggered
+2026-11-05T09:14:22Z ERROR device=FortiGate host=edge-fw-01 src=10.0.0.99 dst=192.168.1.1 msg="Policy deny" policy=block_outbound
